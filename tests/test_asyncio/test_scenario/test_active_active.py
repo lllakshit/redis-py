@@ -2,6 +2,7 @@ import asyncio
 import json
 import logging
 import os
+from time import monotonic
 
 import pytest
 
@@ -20,6 +21,22 @@ from tests.test_scenario.fault_injector_client import ActionRequest, ActionType
 
 logger = logging.getLogger(__name__)
 
+# The injected network failure is transient - the fault injector restores the link a
+# few seconds after the action is triggered. A database is only taken out of service by
+# a health check probe that runs while the link is down, and on the default interval a
+# probe round is short next to the pause that follows it, so most rounds land after the
+# link is already back and no failover is ever initiated. Probing back to back keeps a
+# round inside the outage.
+FAILOVER_HEALTH_CHECK_INTERVAL = 0.1
+# Bounded here rather than left to pytest-timeout so a failover that never happens is
+# reported as a failover that never happened, instead of as a stack dump of whatever
+# the test was doing when the deadline passed. Kept well inside the per-test timeout so
+# the assertion below is what fires.
+FAILOVER_TIMEOUT = 60
+FAILOVER_TIMEOUT_MESSAGE = (
+    f"Active database has not changed within {FAILOVER_TIMEOUT} seconds of the "
+    "injected network failure"
+)
 # The Redis Enterprise REST API credentials LagAwareHealthCheck authenticates with.
 # They come from the test environment, and without them every probe gets HTTP 401 and
 # both databases are reported unhealthy - which fails the initial health check instead
@@ -89,8 +106,16 @@ class TestActiveActive:
     @pytest.mark.parametrize(
         "r_multi_db",
         [
-            {"client_class": Redis, "min_num_failures": 2},
-            {"client_class": RedisCluster, "min_num_failures": 2},
+            {
+                "client_class": Redis,
+                "min_num_failures": 2,
+                "health_check_interval": FAILOVER_HEALTH_CHECK_INTERVAL,
+            },
+            {
+                "client_class": RedisCluster,
+                "min_num_failures": 2,
+                "health_check_interval": FAILOVER_HEALTH_CHECK_INTERVAL,
+            },
         ],
         ids=["standalone", "cluster"],
         indirect=True,
@@ -131,7 +156,9 @@ class TestActiveActive:
                 await asyncio.sleep(0.5)
 
             # Execute commands until database failover
+            deadline = monotonic() + FAILOVER_TIMEOUT
             while not listener.is_changed_flag:
+                assert monotonic() < deadline, FAILOVER_TIMEOUT_MESSAGE
                 assert (
                     await retry.call_with_retry(
                         lambda: r_multi_db.get("key"), lambda _: dummy_fail_async()
@@ -151,10 +178,11 @@ class TestActiveActive:
                     LagAwareHealthCheck(
                         verify_tls=False,
                         auth_basic=lag_aware_auth_basic(),
+                        lag_aware_tolerance=10000,
                         health_check_timeout=LAG_AWARE_HEALTH_CHECK_TIMEOUT,
                     )
                 ],
-                "health_check_interval": 20,
+                "health_check_interval": FAILOVER_HEALTH_CHECK_INTERVAL,
             },
             {
                 "client_class": RedisCluster,
@@ -163,10 +191,11 @@ class TestActiveActive:
                     LagAwareHealthCheck(
                         verify_tls=False,
                         auth_basic=lag_aware_auth_basic(),
+                        lag_aware_tolerance=10000,
                         health_check_timeout=LAG_AWARE_HEALTH_CHECK_TIMEOUT,
                     )
                 ],
-                "health_check_interval": 20,
+                "health_check_interval": FAILOVER_HEALTH_CHECK_INTERVAL,
             },
         ],
         ids=["standalone", "cluster"],
@@ -208,7 +237,9 @@ class TestActiveActive:
                 await asyncio.sleep(0.5)
 
             # Execute commands after network failure
+            deadline = monotonic() + FAILOVER_TIMEOUT
             while not listener.is_changed_flag:
+                assert monotonic() < deadline, FAILOVER_TIMEOUT_MESSAGE
                 assert (
                     await retry.call_with_retry(
                         lambda: r_multi_db.get("key"), lambda _: dummy_fail_async()
@@ -270,8 +301,8 @@ class TestActiveActive:
                 )
                 await asyncio.sleep(0.5)
 
-            # Execute commands until database failover
-            while not listener.is_changed_flag:
+            # Execute pipeline until database failover
+            for _ in range(5):
                 await retry.call_with_retry(
                     lambda: callback(), lambda _: dummy_fail_async()
                 )
@@ -331,7 +362,7 @@ class TestActiveActive:
                 await asyncio.sleep(0.5)
 
             # Execute pipeline until database failover
-            while not listener.is_changed_flag:
+            for _ in range(5):
                 await retry.call_with_retry(
                     lambda: callback(), lambda _: dummy_fail_async()
                 )
@@ -341,8 +372,16 @@ class TestActiveActive:
     @pytest.mark.parametrize(
         "r_multi_db",
         [
-            {"client_class": Redis, "min_num_failures": 2},
-            {"client_class": RedisCluster, "min_num_failures": 2},
+            {
+                "client_class": Redis,
+                "min_num_failures": 2,
+                "health_check_interval": FAILOVER_HEALTH_CHECK_INTERVAL,
+            },
+            {
+                "client_class": RedisCluster,
+                "min_num_failures": 2,
+                "health_check_interval": FAILOVER_HEALTH_CHECK_INTERVAL,
+            },
         ],
         ids=["standalone", "cluster"],
         indirect=True,
@@ -384,7 +423,9 @@ class TestActiveActive:
                 await asyncio.sleep(0.5)
 
             # Execute transaction until database failover
+            deadline = monotonic() + FAILOVER_TIMEOUT
             while not listener.is_changed_flag:
+                assert monotonic() < deadline, FAILOVER_TIMEOUT_MESSAGE
                 assert await retry.call_with_retry(
                     lambda: r_multi_db.transaction(callback),
                     lambda _: dummy_fail_async(),
@@ -392,7 +433,16 @@ class TestActiveActive:
                 await asyncio.sleep(0.5)
 
     @pytest.mark.asyncio
-    @pytest.mark.parametrize("r_multi_db", [{"min_num_failures": 2}], indirect=True)
+    @pytest.mark.parametrize(
+        "r_multi_db",
+        [
+            {
+                "min_num_failures": 2,
+                "health_check_interval": FAILOVER_HEALTH_CHECK_INTERVAL,
+            }
+        ],
+        indirect=True,
+    )
     @pytest.mark.timeout(200)
     async def test_pubsub_failover_to_another_db(
         self, r_multi_db, fault_injector_client
@@ -437,7 +487,9 @@ class TestActiveActive:
                 await asyncio.sleep(0.5)
 
             # Execute publish until database failover
+            deadline = monotonic() + FAILOVER_TIMEOUT
             while not listener.is_changed_flag:
+                assert monotonic() < deadline, FAILOVER_TIMEOUT_MESSAGE
                 await retry.call_with_retry(
                     lambda: r_multi_db.publish("test-channel", data),
                     lambda _: dummy_fail_async(),

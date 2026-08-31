@@ -1069,7 +1069,8 @@ class TestStandaloneClientPushNotificationsHandlingWithEffectTrigger(
                     client.get("key")
                 except Exception as e:
                     errors.put(
-                        f"Command failed in thread {threading.current_thread().name}: {e}"
+                        f"[mono={time.monotonic():.6f}] Command failed in thread "
+                        f"{threading.current_thread().name}: {e}"
                     )
 
         # get the connection here because in case of proxy server
@@ -1452,7 +1453,8 @@ class TestStandaloneClientCommandsExecutionWithPushNotificationsWithEffectTrigge
                         f"Error in thread {threading.current_thread().name}: {e}"
                     )
                     errors.put(
-                        f"Command failed in thread {threading.current_thread().name}: {e}"
+                        f"[mono={time.monotonic():.6f}] Command failed in thread "
+                        f"{threading.current_thread().name}: {e}"
                     )
             logging.debug(f"{threading.current_thread().name}: Thread ended")
 
@@ -2339,7 +2341,8 @@ class TestClusterClientCommandsExecutionWithPushNotificationsWithEffectTrigger(
                             f"Error in thread {threading.current_thread().name}: {e}"
                         )
                         errors.put(
-                            f"Command failed in thread {threading.current_thread().name}: {e}"
+                            f"[mono={time.monotonic():.6f}] Command failed in thread "
+                            f"{threading.current_thread().name}: {e}"
                         )
                 if executed_commands_count % 500 == 0:
                     logging.debug(

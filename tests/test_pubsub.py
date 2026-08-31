@@ -341,6 +341,43 @@ class TestClusterShardedPubSubDelivery:
         finally:
             p.close()
 
+    def test_handler_may_ssubscribe_from_inside_the_handler(self, r):
+        """
+        A message handler runs inside get_sharded_message, so an ssubscribe
+        from inside it re-enters the per-node I/O lock and then takes
+        _shard_state_lock. Holding the I/O lock across the dispatch deadlocked
+        against the reconciliation worker.
+        """
+        first = "handler-resub-a-{shared}"
+        second = "handler-resub-b-{shared}"
+        p = r.pubsub()
+        resubscribed = threading.Event()
+
+        def handler(message):
+            if not resubscribed.is_set():
+                p.ssubscribe(second)
+                resubscribed.set()
+
+        try:
+            p.ssubscribe(**{first: handler})
+            self._wait_for_sharded_acks(p, 1)
+
+            assert r.spublish(first, "go") == 1
+            deadline = time.monotonic() + 5.0
+            while time.monotonic() < deadline and not resubscribed.is_set():
+                p.get_sharded_message(timeout=0.05)
+            assert resubscribed.is_set(), (
+                "handler never completed: the dispatch deadlocked on the "
+                "per-node I/O lock"
+            )
+
+            self._wait_for_sharded_acks(p, 1)
+            assert r.spublish(second, "hi") == 1
+            messages = self._read_sharded_messages(p, expected_count=1)
+            assert [str_if_bytes(m["channel"]) for m in messages] == [second]
+        finally:
+            p.close()
+
     def test_no_messages_delivered_after_sunsubscribe(self, r):
         kept = "still-subscribed-{shared}"
         removed = "removed-{shared}"
@@ -1709,6 +1746,28 @@ class TestPubSubTimeouts:
         p.subscribe("foo")
         poller.join()
 
+    def test_get_message_timeout_none_survives_a_late_subscription(self):
+        """
+        Regression: the subscription-wait prelude charged the time spent
+        waiting against ``timeout``, which raises TypeError when
+        ``timeout=None`` means "block indefinitely".
+        """
+        p = PubSub(mock.MagicMock(), encoder=Encoder("utf-8", "strict", False))
+        p.parse_response = mock.MagicMock(return_value=None)
+        assert p.subscribed is False
+
+        def _late_subscribe():
+            time.sleep(0.05)
+            p.subscribed_event.set()
+
+        subscriber = threading.Thread(target=_late_subscribe, daemon=True)
+        subscriber.start()
+        try:
+            assert p.get_message(timeout=None) is None
+        finally:
+            subscriber.join(timeout=5.0)
+        p.parse_response.assert_called_once_with(block=True, timeout=None)
+
     def test_get_message_wait_for_subscription_not_being_called(self, r):
         p = r.pubsub()
         p.subscribe("foo")
@@ -2893,6 +2952,31 @@ class TestClusterPubSubSlotMigration:
         p.shard_channels = dict(shard_channels or {})
         p.pending_unsubscribe_shard_channels = set()
         p.subscribed = True
+        # A real, already-set Event: _poll_node_pubsub mirrors get_message's
+        # prelude, which waits on it whenever ``subscribed`` is False.
+        p.subscribed_event = threading.Event()
+        p.subscribed_event.set()
+        # ClusterPubSub polls a per-node pubsub as parse_response (under the
+        # per-node I/O lock) followed by handle_message (outside it, so a user
+        # handler may re-subscribe). Tests keep configuring the single
+        # ``get_message`` seam; these two forward to it - parse_response yields
+        # the raw reply shape _is_publish_response inspects, handle_message
+        # returns the already-parsed message the assertions compare against.
+        p.get_message = mock.MagicMock(return_value=None)
+        p._last_message = None
+
+        def _parse_response(block=True, timeout=0.0):
+            message = p.get_message(ignore_subscribe_messages=False, timeout=timeout)
+            p._last_message = message
+            if message is None:
+                return None
+            return [message["type"], message.get("channel"), message.get("data")]
+
+        def _handle_message(response, ignore_subscribe_messages=False):
+            return p._last_message
+
+        p.parse_response = mock.MagicMock(side_effect=_parse_response)
+        p.handle_message = mock.MagicMock(side_effect=_handle_message)
         return p
 
     def test_reinitialize_moves_channel_to_new_owner(self):
@@ -3883,6 +3967,195 @@ class TestClusterPubSubSlotMigration:
         assert "127.0.0.1:7000" not in pubsub.node_pubsub_mapping
         assert pubsub._unreachable_nodes == set()
 
+    # --- per-node I/O lock scope ------------------------------------------
+
+    def _make_real_node_pubsub(self, raw_response, handler=None, channel=b"foo"):
+        """A real per-node ``PubSub`` with only the wire read stubbed.
+
+        ``handle_message`` stays real so the assertions exercise the actual
+        dispatch, and a real ``_shard_io_lock`` gets attached by
+        ``_pubsub_io_lock`` - a ``MagicMock`` stand-in would hand back a mock
+        that supports ``__enter__``, making every lock-scope assertion
+        vacuously true.
+        """
+        p = PubSub(mock.MagicMock(), encoder=Encoder("utf-8", "strict", False))
+        p.shard_channels = {channel: handler}
+        p.subscribed_event.set()
+        p.parse_response = mock.MagicMock(return_value=raw_response)
+        return p
+
+    @pytest.mark.parametrize("via_target_node", [True, False])
+    def test_handler_runs_without_the_node_io_lock(self, via_target_node):
+        """
+        The per-node I/O lock must not be held while handle_message invokes a
+        user handler. A handler may call ssubscribe / sunsubscribe on this
+        ClusterPubSub, which takes _shard_state_lock and then the same I/O
+        lock - and the reconciliation worker takes them in that order too, so
+        holding the I/O lock across the handler is an ABBA deadlock (see
+        test_handler_resubscribe_does_not_deadlock_against_reconciler).
+        """
+        pubsub = self._make_cluster_pubsub()
+        node = self._make_node("127.0.0.1:7000")
+        observed = []
+        node_ps = self._make_real_node_pubsub(
+            [b"smessage", b"foo", b"hi"],
+            handler=lambda message: observed.append(
+                _rlock_held_by_another_thread(io_lock)
+            ),
+        )
+        io_lock = ClusterPubSub._pubsub_io_lock(node_ps)
+        pubsub.node_pubsub_mapping[node.name] = node_ps
+        pubsub._pubsubs_generator = ClusterPubSub._pubsubs_generator(pubsub)
+
+        if via_target_node:
+            message = pubsub.get_sharded_message(timeout=0.01, target_node=node)
+        else:
+            message = pubsub.get_sharded_message(timeout=0.01)
+
+        assert observed == [False]
+        # A dispatched handler consumes the message.
+        assert message is None
+
+    @pytest.mark.parametrize(
+        "raw_response,expect_lock_held",
+        [
+            ([b"ssubscribe", b"foo", 1], True),
+            ([b"sunsubscribe", b"foo", 0], True),
+            ([b"smessage", b"foo", b"hi"], False),
+        ],
+    )
+    def test_bookkeeping_stays_under_the_io_lock(self, raw_response, expect_lock_held):
+        """
+        Only handler dispatch leaves the I/O lock. handle_message's
+        subscription bookkeeping mutates the same shard_channels /
+        pending_unsubscribe_shard_channels that ssubscribe / sunsubscribe
+        mutate under this lock, so it must stay inside it.
+        """
+        pubsub = self._make_cluster_pubsub()
+        node = self._make_node("127.0.0.1:7000")
+        node_ps = self._make_real_node_pubsub(raw_response, handler=lambda m: None)
+        io_lock = ClusterPubSub._pubsub_io_lock(node_ps)
+        pubsub.node_pubsub_mapping[node.name] = node_ps
+
+        observed = []
+        real_handle_message = node_ps.handle_message
+
+        def _spy(response, ignore_subscribe_messages=False):
+            observed.append(_rlock_held_by_another_thread(io_lock))
+            return real_handle_message(response, ignore_subscribe_messages)
+
+        node_ps.handle_message = _spy
+
+        pubsub.get_sharded_message(timeout=0.01, target_node=node)
+
+        assert observed == [expect_lock_held]
+
+    def test_handler_may_resubscribe_from_inside_the_handler(self):
+        """
+        A handler may call ssubscribe from inside itself. Passes before the
+        fix too - threading.RLock is reentrant, so the reader re-entering its
+        own I/O lock succeeds. The teeth are in
+        test_handler_resubscribe_does_not_deadlock_against_reconciler, where a
+        second thread owns _shard_state_lock.
+        """
+        pubsub = self._make_cluster_pubsub()
+        node = self._make_node("127.0.0.1:7000")
+        pubsub.cluster.get_node_from_key.return_value = node
+        node_ps = self._make_real_node_pubsub(
+            [b"smessage", b"foo", b"hi"],
+            handler=lambda message: pubsub.ssubscribe(b"bar"),
+        )
+        node_ps.ssubscribe = mock.MagicMock()
+        pubsub.node_pubsub_mapping[node.name] = node_ps
+
+        with mock.patch.object(pubsub, "_get_node_pubsub", return_value=node_ps):
+            assert pubsub.get_sharded_message(timeout=0.01, target_node=node) is None
+
+        node_ps.ssubscribe.assert_called_once_with(b"bar")
+
+    def test_handler_resubscribe_does_not_deadlock_against_reconciler(self):
+        """
+        ABBA regression: the reconciliation worker holds _shard_state_lock and
+        then waits for a node's I/O lock, while a handler that re-subscribes
+        needs _shard_state_lock. So a handler must never run while the reader
+        holds that I/O lock. threading.RLock's self-reentrancy does not help -
+        the two locks are owned by different threads.
+        """
+        pubsub = self._make_cluster_pubsub()
+        node = self._make_node("127.0.0.1:7000")
+        pubsub.cluster.get_node_from_key.return_value = node
+
+        reconciler_may_start = threading.Event()
+        reconciler_holds_state_lock = threading.Event()
+        reconciler_done = threading.Event()
+        reader_done = threading.Event()
+
+        def handler(message):
+            # Needs _shard_state_lock, which the reconciler holds while it
+            # waits for this node's I/O lock.
+            pubsub.ssubscribe(b"bar")
+
+        node_ps = self._make_real_node_pubsub([b"smessage", b"foo", b"hi"], handler)
+        node_ps.ssubscribe = mock.MagicMock()
+        io_lock = ClusterPubSub._pubsub_io_lock(node_ps)
+        pubsub.node_pubsub_mapping[node.name] = node_ps
+
+        def _parse_response(block=True, timeout=0.0):
+            # Runs inside the I/O lock: park the reconciler on
+            # _shard_state_lock first, so the cycle is fully formed before
+            # this read returns.
+            reconciler_may_start.set()
+            assert reconciler_holds_state_lock.wait(timeout=5.0)
+            return [b"smessage", b"foo", b"hi"]
+
+        node_ps.parse_response = mock.MagicMock(side_effect=_parse_response)
+
+        def _reconciler():
+            assert reconciler_may_start.wait(timeout=5.0)
+            with pubsub._shard_state_lock:
+                reconciler_holds_state_lock.set()
+                with io_lock:
+                    pass
+            reconciler_done.set()
+
+        def _reader():
+            with mock.patch.object(pubsub, "_get_node_pubsub", return_value=node_ps):
+                pubsub.get_sharded_message(timeout=0.01, target_node=node)
+            reader_done.set()
+
+        reconciler = threading.Thread(target=_reconciler, daemon=True)
+        reader = threading.Thread(target=_reader, daemon=True)
+        reconciler.start()
+        reader.start()
+
+        assert reader_done.wait(timeout=5.0), (
+            "reader deadlocked: the handler waited for _shard_state_lock while "
+            "still holding the node I/O lock the reconciler needs"
+        )
+        assert reconciler_done.wait(timeout=5.0)
+        node_ps.ssubscribe.assert_called_once_with(b"bar")
+
+
+def _rlock_held_by_another_thread(lock):
+    """Whether ``lock`` is currently held, probed from a foreign thread.
+
+    ``threading.RLock`` is reentrant, so ``acquire(blocking=False)`` on the
+    owning thread always succeeds and would make the assertion vacuous.
+    """
+    result = []
+
+    def _probe():
+        acquired = lock.acquire(blocking=False)
+        if acquired:
+            lock.release()
+        result.append(not acquired)
+
+    probe = threading.Thread(target=_probe, daemon=True)
+    probe.start()
+    probe.join(timeout=5.0)
+    assert result, "lock probe thread did not finish"
+    return result[0]
+
 
 class _StatefulNodePubSub:
     """Per-node ``PubSub`` stand-in with real subscription state.
@@ -3922,10 +4195,22 @@ class _StatefulNodePubSub:
         if not self.shard_channels:
             self.subscribed_event.clear()
 
-    def get_message(self, ignore_subscribe_messages=False, timeout=0.0):
+    def parse_response(self, block=True, timeout=0.0):
+        # ClusterPubSub polls a per-node pubsub as parse_response (under the
+        # per-node I/O lock) followed by handle_message (outside it), so the
+        # injected failure has to surface from the read half.
         if self.get_message_error is not None:
             raise self.get_message_error
         return None
+
+    def handle_message(self, response, ignore_subscribe_messages=False):
+        return response
+
+    def get_message(self, ignore_subscribe_messages=False, timeout=0.0):
+        return self.handle_message(
+            self.parse_response(block=(timeout is None), timeout=timeout),
+            ignore_subscribe_messages,
+        )
 
     def reset(self):
         self.reset_calls += 1

@@ -1577,9 +1577,11 @@ class AbstractConnection(MaintNotificationsAbstractConnection, ConnectionInterfa
           node being moved away from, or has already been repointed at the new one.
         - ``state`` says whether maintenance handling touched this connection at
           all, so an unaffected node's connections are distinguishable.
-        - ``socket_timeout`` vs ``active read timeout`` says which timeout the read
-          actually ran under. They diverge for a command that was already in flight
-          when the relaxed timeout was applied.
+        - ``socket_timeout`` vs ``active read timeout`` says which timeout the
+          *next* read will run under. They diverge while a per-call timeout
+          override is armed, and while a relaxation has been applied to the
+          socket but not to the connection. Neither field reports the deadline an
+          already-blocked read is using; that value is not observable from here.
         """
         if self._sock is None:
             return "not connected"
@@ -1591,8 +1593,13 @@ class AbstractConnection(MaintNotificationsAbstractConnection, ConnectionInterfa
             # AF_UNIX sockets report a path string rather than a (host, port) tuple
             if isinstance(socket_name, tuple) and len(socket_name) > 1:
                 socket_address = socket_name[1]
-            # The timeout armed on the socket is what a blocking read is really
-            # using, which can lag self.socket_timeout for an in-flight command.
+            # The timeout currently armed on the socket object. Note this is
+            # NOT the deadline an already-blocked read is running under: a
+            # recv() computes its deadline from the value in effect when it was
+            # entered, and a settimeout() from another thread updates this
+            # attribute immediately without moving that deadline. So for a
+            # command that was in flight when a relaxed timeout was applied this
+            # runs *ahead* of the read - it reports what the next read will use.
             active_read_timeout = self._sock.gettimeout()
         except (AttributeError, OSError):
             pass

@@ -3340,13 +3340,7 @@ class ClusterPubSub(PubSub):
                 continue
             polled += 1
             try:
-                with self._poll_io_lock(pubsub, timeout):
-                    # Don't pass ignore_subscribe_messages here - let
-                    # get_sharded_message handle the filtering after processing
-                    # subscription state changes
-                    message = pubsub.get_message(
-                        ignore_subscribe_messages=False, timeout=timeout
-                    )
+                message = self._poll_node_pubsub(pubsub, timeout)
             except MovedError as e:
                 # Handled, not failed: _handle_moved_on_read re-routes the
                 # offending channels and schedules reconciliation, so the next
@@ -3415,9 +3409,9 @@ class ClusterPubSub(PubSub):
     def _poll_io_lock(self, pubsub, timeout):
         """Guard a per-node poll against concurrent writers on the same socket.
 
-        ``timeout=None`` means ``PubSub.get_message`` blocks indefinitely, so
-        holding the lock across it would block reconciliation for as long as no
-        message arrives. Such a caller drives the pubsub itself and gets the
+        ``timeout=None`` makes ``_poll_node_pubsub``'s read block indefinitely,
+        so holding the lock across it would block reconciliation for as long as
+        no message arrives. Such a caller drives the pubsub itself and gets the
         pre-existing unguarded behaviour; every bounded poll - which is what
         ``PubSubWorkerThread`` and ``ClusterPubSub``'s own callers use - is
         serialized.
@@ -3425,6 +3419,83 @@ class ClusterPubSub(PubSub):
         if timeout is None:
             return nullcontext()
         return self._pubsub_io_lock(pubsub)
+
+    def _poll_node_pubsub(self, pubsub, timeout):
+        """Read one message from a per-node pubsub, dispatching outside the lock.
+
+        Splits ``PubSub.get_message`` so the per-node I/O lock covers the wire
+        read only. ``handle_message`` invokes a subscribed channel's user
+        handler inline, and a handler is free to call ``ssubscribe`` /
+        ``sunsubscribe`` on this ``ClusterPubSub`` - which takes
+        ``_shard_state_lock`` and then the same I/O lock. Holding the I/O lock
+        across the handler therefore deadlocks against the reconciliation
+        worker, which holds ``_shard_state_lock`` and waits for that I/O lock:
+        an ABBA cycle between two threads that the ``RLock``'s self-reentrancy
+        cannot break. The async counterpart's non-reentrant ``asyncio.Lock``
+        hangs on the re-acquire alone, before any reconciliation is involved.
+
+        The two halves of ``handle_message`` are mutually exclusive:
+        ``UNSUBSCRIBE_MESSAGE_TYPES`` does subscription bookkeeping and never
+        reaches a handler, ``PUBLISH_MESSAGE_TYPES`` only dispatches. So
+        bookkeeping stays inside the lock - it mutates the very
+        ``shard_channels`` / ``pending_unsubscribe_shard_channels`` that
+        ``ssubscribe`` / ``sunsubscribe`` mutate under this lock - and only the
+        dispatch moves out. The cost is a narrow race: a reconciliation pass
+        that detaches the channel between the read and the dispatch makes the
+        handler lookup miss, so the message is returned to the caller instead
+        of dispatched. That is the same in-flight-during-unsubscribe race
+        ``PubSub`` itself has, and closing it would mean duplicating
+        ``handle_message``'s dispatch here.
+        """
+        # ``PubSub.get_message``'s prelude, which bypassing it would drop: a
+        # per-node pubsub enters node_pubsub_mapping before its first
+        # SSUBSCRIBE (_get_node_pubsub) and is left connectionless by reset()
+        # (the GC in reinitialize_shard_subscriptions), while parse_response
+        # raises RuntimeError on a None connection - which neither poll site
+        # catches. Deliberately kept outside the I/O lock, unlike the
+        # get_message call it replaces: waiting here is not wire I/O, and the
+        # ssubscribe that sets this event needs the I/O lock itself, so waiting
+        # under it stalls the very subscribe being waited for.
+        if not pubsub.subscribed:
+            start_time = time.monotonic()
+            if pubsub.subscribed_event.wait(timeout) is True:
+                # The connection was subscribed during the timeout time frame.
+                # The timeout should be adjusted based on the time spent
+                # waiting for the subscription.
+                if timeout is not None:
+                    timeout = max(0.0, timeout - (time.monotonic() - start_time))
+            else:
+                # The connection isn't subscribed to any channels or patterns,
+                # so no messages are available
+                return None
+        with self._poll_io_lock(pubsub, timeout):
+            response = pubsub.parse_response(block=(timeout is None), timeout=timeout)
+            # get_message's truthiness test, not "is None": a health check
+            # reply filtered out by parse_response, or an empty bulk, is "no
+            # message" rather than a message to parse.
+            if not response:
+                return None
+            if not self._is_publish_response(response):
+                # Don't pass ignore_subscribe_messages here - let
+                # get_sharded_message handle the filtering after processing
+                # subscription state changes
+                return pubsub.handle_message(response, ignore_subscribe_messages=False)
+        return pubsub.handle_message(response, ignore_subscribe_messages=False)
+
+    @staticmethod
+    def _is_publish_response(response) -> bool:
+        """Whether a raw pubsub reply can make ``handle_message`` dispatch.
+
+        ``handle_message`` invokes a user handler only for
+        ``PUBLISH_MESSAGE_TYPES``; every other reply either does subscription
+        bookkeeping (``UNSUBSCRIBE_MESSAGE_TYPES``) or is a pong, and the two
+        branches are mutually exclusive. A non-sequence reply is the bare-PING
+        shape ``handle_message`` rewrites into a pong, so it cannot dispatch
+        either.
+        """
+        if not isinstance(response, (list, tuple)):
+            return False
+        return str_if_bytes(response[0]) in PubSub.PUBLISH_MESSAGE_TYPES
 
     def _schedule_topology_repair(self) -> None:
         """Ask for a slots-cache refresh after a poll could not reach a node.
@@ -3546,13 +3617,7 @@ class ClusterPubSub(PubSub):
             # KeyError. None pubsub falls through to "no message available".
             pubsub = self.node_pubsub_mapping.get(target_node.name)
             if pubsub is not None:
-                with self._poll_io_lock(pubsub, timeout):
-                    # Don't pass ignore_subscribe_messages here - let
-                    # get_sharded_message handle the filtering after processing
-                    # subscription state changes
-                    message = pubsub.get_message(
-                        ignore_subscribe_messages=False, timeout=timeout
-                    )
+                message = self._poll_node_pubsub(pubsub, timeout)
             else:
                 message = None
         else:
@@ -3564,9 +3629,9 @@ class ClusterPubSub(PubSub):
         # competing with the reconciliation worker for _shard_state_lock.
         if str_if_bytes(message["type"]) == "sunsubscribe":
             # Serialize state mutation against reinitialize_shard_subscriptions
-            # (worker thread). The blocking get_message above intentionally
-            # runs outside the lock so reconciliation is not stalled by long
-            # polls.
+            # (worker thread). The blocking _poll_node_pubsub above
+            # intentionally runs outside the lock so reconciliation is not
+            # stalled by long polls.
             with self._shard_state_lock:
                 if message["channel"] in self.pending_unsubscribe_shard_channels:
                     # User-initiated sunsubscribe: drop from cluster-level tracking.

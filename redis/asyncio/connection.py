@@ -855,10 +855,10 @@ class AbstractConnection(AsyncMaintNotificationsAbstractConnection):
         - ``state`` says whether maintenance handling touched this connection at
           all, so an unaffected node's connections are distinguishable.
         - ``socket_timeout`` vs ``active read timeout`` says which timeout the read
-          actually ran under. ``active read timeout`` is the remaining deadline of
-          the in-flight ``read_response`` (``None`` when no read is in flight), so
-          the two diverge for a command that was already reading when the relaxed
-          timeout was applied.
+          is running under. Unlike the sync stack, ``active read timeout`` here is
+          the genuine remaining deadline of the in-flight ``read_response``
+          (``None`` when no read is in flight), because the async stack reschedules
+          that deadline when a relaxation is applied.
         """
         writer = self._writer
         if writer is None:

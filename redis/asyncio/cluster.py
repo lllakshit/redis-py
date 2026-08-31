@@ -3967,11 +3967,15 @@ class ClusterPubSub(PubSub):
         is being migrated away from, on every reconnect. Once the caller has
         decided the channel belongs to a different node, the local intent is
         the only truth left, so drop it here.
+
+        Unlike the sync counterpart there is no ``subscribed_event`` to clear
+        once the last subscription is gone: the async ``PubSub`` has no such
+        event, and its ``subscribed`` is a plain property derived from the
+        subscription dicts - including the ``shard_channels`` entry just
+        dropped here.
         """
         pubsub.shard_channels.pop(channel, None)
         pubsub.pending_unsubscribe_shard_channels.discard(channel)
-        if not pubsub.channels and not pubsub.patterns and not pubsub.shard_channels:
-            pubsub.subscribed_event.clear()
 
     async def _sharded_message_generator(
         self, timeout: float = 0.0
@@ -3994,13 +3998,7 @@ class ClusterPubSub(PubSub):
                 continue
             polled += 1
             try:
-                async with self._poll_io_lock(pubsub, timeout):
-                    # Don't pass ignore_subscribe_messages here - let
-                    # get_sharded_message handle the filtering after processing
-                    # subscription state changes
-                    message = await pubsub.get_message(
-                        ignore_subscribe_messages=False, timeout=timeout
-                    )
+                message = await self._poll_node_pubsub(pubsub, timeout)
             except MovedError as e:
                 # Handled, not failed: _handle_moved_on_read re-routes the
                 # offending channels and schedules reconciliation, so the next
@@ -4069,15 +4067,82 @@ class ClusterPubSub(PubSub):
     def _poll_io_lock(self, pubsub: PubSub, timeout: Optional[float]):
         """Guard a per-node poll against concurrent writers on the same socket.
 
-        ``timeout=None`` means ``PubSub.get_message`` waits indefinitely, so
-        holding the lock across it would block reconciliation for as long as no
-        message arrives. Such a caller drives the pubsub itself and gets the
+        ``timeout=None`` makes ``_poll_node_pubsub``'s read wait indefinitely,
+        so holding the lock across it would block reconciliation for as long as
+        no message arrives. Such a caller drives the pubsub itself and gets the
         pre-existing unguarded behaviour; every bounded poll - which is what
         ``ClusterPubSub``'s own callers use - is serialized.
         """
         if timeout is None:
             return nullcontext()
         return self._pubsub_io_lock(pubsub)
+
+    async def _poll_node_pubsub(
+        self, pubsub: PubSub, timeout: Optional[float]
+    ) -> Optional[Dict[str, Any]]:
+        """Read one message from a per-node pubsub, dispatching outside the lock.
+
+        Splits ``PubSub.get_message`` so the per-node I/O lock covers the wire
+        read only. ``handle_message`` awaits a subscribed channel's user
+        handler inline, and a handler is free to await ``ssubscribe`` /
+        ``sunsubscribe`` on this ``ClusterPubSub`` - which takes
+        ``_shard_state_lock`` and then the same I/O lock. ``asyncio.Lock`` is
+        not reentrant, so holding the I/O lock across the handler hangs the
+        reader task permanently and silently on the re-acquire; even a
+        task-reentrant lock would still deadlock against the reconciliation
+        task, which holds ``_shard_state_lock`` and awaits that I/O lock.
+
+        The two halves of ``handle_message`` are mutually exclusive:
+        ``UNSUBSCRIBE_MESSAGE_TYPES`` does subscription bookkeeping and never
+        reaches a handler, ``PUBLISH_MESSAGE_TYPES`` only dispatches. So
+        bookkeeping stays inside the lock - it mutates the very
+        ``shard_channels`` / ``pending_unsubscribe_shard_channels`` that
+        ``ssubscribe`` / ``sunsubscribe`` mutate under this lock - and only the
+        dispatch moves out. The cost is a narrow race: a reconciliation pass
+        that detaches the channel between the read and the dispatch makes the
+        handler lookup miss, so the message is returned to the caller instead
+        of dispatched. That is the same in-flight-during-unsubscribe race
+        ``PubSub`` itself has, and closing it would mean duplicating
+        ``handle_message``'s dispatch here.
+
+        The async ``PubSub.get_message`` has no subscription-wait prelude to
+        mirror - ``subscribed`` is a plain property and there is no
+        ``subscribed_event`` - so this reads the wire directly. The sync
+        counterpart in ``redis/cluster.py`` carries that prelude, and hoists it
+        out of the lock.
+        """
+        async with self._poll_io_lock(pubsub, timeout):
+            response = await pubsub.parse_response(
+                block=(timeout is None), timeout=timeout
+            )
+            # get_message's truthiness test, not "is None": a health check
+            # reply filtered out by parse_response, or an empty bulk, is "no
+            # message" rather than a message to parse.
+            if not response:
+                return None
+            if not self._is_publish_response(response):
+                # Don't pass ignore_subscribe_messages here - let
+                # get_sharded_message handle the filtering after processing
+                # subscription state changes
+                return await pubsub.handle_message(
+                    response, ignore_subscribe_messages=False
+                )
+        return await pubsub.handle_message(response, ignore_subscribe_messages=False)
+
+    @staticmethod
+    def _is_publish_response(response: Any) -> bool:
+        """Whether a raw pubsub reply can make ``handle_message`` dispatch.
+
+        ``handle_message`` awaits a user handler only for
+        ``PUBLISH_MESSAGE_TYPES``; every other reply either does subscription
+        bookkeeping (``UNSUBSCRIBE_MESSAGE_TYPES``) or is a pong, and the two
+        branches are mutually exclusive. A non-sequence reply is the bare-PING
+        shape ``handle_message`` rewrites into a pong, so it cannot dispatch
+        either.
+        """
+        if not isinstance(response, (list, tuple)):
+            return False
+        return str_if_bytes(response[0]) in PubSub.PUBLISH_MESSAGE_TYPES
 
     def _schedule_topology_repair(self) -> None:
         """Ask for a slots-cache refresh after a poll could not reach a node.
@@ -4184,13 +4249,7 @@ class ClusterPubSub(PubSub):
         if target_node:
             pubsub = self.node_pubsub_mapping.get(target_node.name)
             if pubsub:
-                async with self._poll_io_lock(pubsub, timeout):
-                    # Don't pass ignore_subscribe_messages here - let
-                    # get_sharded_message handle the filtering after processing
-                    # subscription state changes
-                    message = await pubsub.get_message(
-                        ignore_subscribe_messages=False, timeout=timeout
-                    )
+                message = await self._poll_node_pubsub(pubsub, timeout)
             else:
                 message = None
         else:
@@ -4203,9 +4262,9 @@ class ClusterPubSub(PubSub):
         # competing with the reconciliation task for _shard_state_lock.
         if str_if_bytes(message["type"]) == "sunsubscribe":
             # Serialize state mutation against reinitialize_shard_subscriptions
-            # (background task). The blocking get_message above intentionally
-            # runs outside the lock so reconciliation is not stalled by long
-            # polls.
+            # (background task). The blocking _poll_node_pubsub above
+            # intentionally runs outside the lock so reconciliation is not
+            # stalled by long polls.
             async with self._shard_state_lock:
                 if message["channel"] in self.pending_unsubscribe_shard_channels:
                     # User-initiated sunsubscribe: drop from cluster-level tracking.

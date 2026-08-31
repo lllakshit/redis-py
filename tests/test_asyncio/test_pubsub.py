@@ -2383,7 +2383,6 @@ class TestClusterPubSubSlotMigration:
         pubsub.encoder = Encoder("utf-8", "strict", False)
         pubsub.connection = None
         pubsub._lock = asyncio.Lock()
-        pubsub.subscribed_event = asyncio.Event()
         pubsub.health_check_response_counter = 0
         pubsub.channels = {}
         pubsub.shard_channels = {}
@@ -2416,6 +2415,28 @@ class TestClusterPubSubSlotMigration:
         p.sunsubscribe = AsyncMock()
         p.get_message = AsyncMock()
         p.aclose = AsyncMock()
+        # ClusterPubSub polls a per-node pubsub as parse_response (under the
+        # per-node I/O lock) followed by handle_message (outside it, so a user
+        # handler may re-subscribe). Tests keep configuring the single
+        # ``get_message`` seam; these two forward to it - parse_response yields
+        # the raw reply shape _is_publish_response inspects, handle_message
+        # returns the already-parsed message the assertions compare against.
+        p._last_message = None
+
+        async def _parse_response(block=True, timeout=0.0):
+            message = await p.get_message(
+                ignore_subscribe_messages=False, timeout=timeout
+            )
+            p._last_message = message
+            if message is None:
+                return None
+            return [message["type"], message.get("channel"), message.get("data")]
+
+        async def _handle_message(response, ignore_subscribe_messages=False):
+            return p._last_message
+
+        p.parse_response = AsyncMock(side_effect=_parse_response)
+        p.handle_message = AsyncMock(side_effect=_handle_message)
         return p
 
     async def test_reinitialize_moves_channel_to_new_owner(self):
@@ -3192,6 +3213,134 @@ class TestClusterPubSubSlotMigration:
         assert "127.0.0.1:7000" not in pubsub.node_pubsub_mapping
         assert pubsub._unreachable_nodes == set()
 
+    # --- per-node I/O lock scope ------------------------------------------
+
+    def _make_real_node_pubsub(self, raw_response, handler=None, channel=b"foo"):
+        """A real per-node ``PubSub`` with only the wire read stubbed.
+
+        ``handle_message`` stays real so the assertions exercise the actual
+        dispatch, and a real ``_shard_io_lock`` gets attached by
+        ``_pubsub_io_lock`` - a ``MagicMock`` stand-in would hand back a mock
+        that supports ``__aenter__``, making every lock-scope assertion
+        vacuously true.
+        """
+        p = PubSub(MagicMock(), encoder=Encoder("utf-8", "strict", False))
+        p.shard_channels = {channel: handler}
+        p.parse_response = AsyncMock(return_value=raw_response)
+        return p
+
+    @pytest.mark.parametrize("via_target_node", [True, False])
+    async def test_handler_runs_without_the_node_io_lock(self, via_target_node):
+        """
+        The per-node I/O lock must not be held while handle_message awaits a
+        user handler. A handler may await ssubscribe / sunsubscribe on this
+        ClusterPubSub, which takes the same I/O lock, and asyncio.Lock is not
+        reentrant - so the reader task used to hang permanently and silently.
+        """
+        pubsub = self._make_cluster_pubsub()
+        node = self._make_node("127.0.0.1:7000")
+        observed = []
+
+        async def handler(message):
+            observed.append(io_lock.locked())
+
+        node_ps = self._make_real_node_pubsub([b"smessage", b"foo", b"hi"], handler)
+        io_lock = ClusterPubSub._pubsub_io_lock(node_ps)
+        pubsub.node_pubsub_mapping[node.name] = node_ps
+        pubsub._pubsubs_generator = ClusterPubSub._pubsubs_generator(pubsub)
+
+        if via_target_node:
+            message = await pubsub.get_sharded_message(timeout=0.01, target_node=node)
+        else:
+            message = await pubsub.get_sharded_message(timeout=0.01)
+
+        assert observed == [False]
+        # A dispatched handler consumes the message.
+        assert message is None
+
+    @pytest.mark.parametrize(
+        "raw_response,expect_lock_held",
+        [
+            ([b"ssubscribe", b"foo", 1], True),
+            ([b"sunsubscribe", b"foo", 0], True),
+            ([b"smessage", b"foo", b"hi"], False),
+        ],
+    )
+    async def test_bookkeeping_stays_under_the_io_lock(
+        self, raw_response, expect_lock_held
+    ):
+        """
+        Only handler dispatch leaves the I/O lock. handle_message's
+        subscription bookkeeping mutates the same shard_channels /
+        pending_unsubscribe_shard_channels that ssubscribe / sunsubscribe
+        mutate under this lock, so it must stay inside it.
+        """
+        pubsub = self._make_cluster_pubsub()
+        node = self._make_node("127.0.0.1:7000")
+
+        async def handler(message):
+            return None
+
+        node_ps = self._make_real_node_pubsub(raw_response, handler)
+        io_lock = ClusterPubSub._pubsub_io_lock(node_ps)
+        pubsub.node_pubsub_mapping[node.name] = node_ps
+
+        observed = []
+        real_handle_message = node_ps.handle_message
+
+        async def _spy(response, ignore_subscribe_messages=False):
+            observed.append(io_lock.locked())
+            return await real_handle_message(response, ignore_subscribe_messages)
+
+        node_ps.handle_message = _spy
+
+        await pubsub.get_sharded_message(timeout=0.01, target_node=node)
+
+        assert observed == [expect_lock_held]
+
+    async def test_handler_may_resubscribe_from_inside_the_handler(self):
+        """
+        Regression: asyncio.Lock is not reentrant, so a handler awaiting
+        ssubscribe / sunsubscribe on this ClusterPubSub - which re-takes the
+        same per-node I/O lock - hung the reader task permanently and
+        silently. wait_for so a regression fails fast instead of hanging CI.
+        """
+        pubsub = self._make_cluster_pubsub()
+        node = self._make_node("127.0.0.1:7000")
+        pubsub.cluster.get_node_from_key.return_value = node
+
+        async def handler(message):
+            await pubsub.ssubscribe(b"bar")
+
+        node_ps = self._make_real_node_pubsub([b"smessage", b"foo", b"hi"], handler)
+        node_ps.ssubscribe = AsyncMock()
+        pubsub.node_pubsub_mapping[node.name] = node_ps
+
+        with mock.patch.object(pubsub, "_get_node_pubsub", return_value=node_ps):
+            message = await asyncio.wait_for(
+                pubsub.get_sharded_message(timeout=0.01, target_node=node),
+                timeout=2.0,
+            )
+
+        assert message is None
+        node_ps.ssubscribe.assert_awaited_once_with(b"bar")
+        assert not ClusterPubSub._pubsub_io_lock(node_ps).locked()
+
+    async def test_detach_shard_channel_on_a_real_node_pubsub(self):
+        """
+        _detach_shard_channel is ported from sync, where PubSub has a
+        subscribed_event to clear. The async PubSub has none, so touching it
+        raised AttributeError out of _forget_shard_channel_on_old_node -
+        which reinitialize_shard_subscriptions does not catch.
+        """
+        node_ps = PubSub(MagicMock(), encoder=Encoder("utf-8", "strict", False))
+        node_ps.shard_channels = {b"foo": None}
+
+        ClusterPubSub._detach_shard_channel(node_ps, b"foo")
+
+        assert node_ps.shard_channels == {}
+        assert not node_ps.subscribed
+
 
 class _StatefulNodePubSub:
     """Per-node ``PubSub`` stand-in with real subscription state.
@@ -3216,7 +3365,11 @@ class _StatefulNodePubSub:
 
     @property
     def subscribed(self):
-        return self.subscribed_event.is_set()
+        # Mirrors the real async PubSub.subscribed property, which is derived
+        # from the subscription dicts. The async PubSub has no
+        # subscribed_event; this stand-in keeps one only so the sync and async
+        # test doubles stay diffable.
+        return bool(self.channels or self.patterns or self.shard_channels)
 
     async def ssubscribe(self, *args):
         for arg in args:
@@ -3231,10 +3384,22 @@ class _StatefulNodePubSub:
         if not self.shard_channels:
             self.subscribed_event.clear()
 
-    async def get_message(self, ignore_subscribe_messages=False, timeout=0.0):
+    async def parse_response(self, block=True, timeout=0.0):
+        # ClusterPubSub polls a per-node pubsub as parse_response (under the
+        # per-node I/O lock) followed by handle_message (outside it), so the
+        # injected failure has to surface from the read half.
         if self.get_message_error is not None:
             raise self.get_message_error
         return None
+
+    async def handle_message(self, response, ignore_subscribe_messages=False):
+        return response
+
+    async def get_message(self, ignore_subscribe_messages=False, timeout=0.0):
+        return await self.handle_message(
+            await self.parse_response(block=(timeout is None), timeout=timeout),
+            ignore_subscribe_messages,
+        )
 
     async def aclose(self):
         self.aclose_calls += 1
