@@ -8,7 +8,7 @@ import weakref
 from abc import ABC, abstractmethod
 from collections import OrderedDict, defaultdict
 from concurrent.futures import Future, ThreadPoolExecutor
-from contextlib import nullcontext
+from contextlib import contextmanager, nullcontext
 from copy import copy
 from enum import Enum
 from itertools import chain
@@ -2397,7 +2397,20 @@ class NodesManager:
         # initialize holds _initialization_lock to dedup multiple calls to reinitialize;
         # note that if we hold both _lock and _initialization_lock, we _must_ acquire
         # _initialization_lock first (ie: to have a consistent order) to avoid deadlock.
+        #
+        # The same ordering rule extends to OSSMaintNotificationsHandler._lock, which
+        # is a third lock in this graph: initialize runs a CLUSTER SLOTS round trip
+        # while holding _initialization_lock, and the response can carry an SMIGRATED
+        # push that is handled inline on that thread and needs the handler's _lock. The
+        # full order is therefore
+        #     _initialization_lock -> OSSMaintNotificationsHandler._lock
+        #         -> NodesManager._lock / connection pool locks
+        # ie: a thread holding the handler's _lock must never wait for
+        # _initialization_lock.
         self._initialization_lock: threading.RLock = threading.RLock()
+        # Ident of the thread currently running initialize, or None. Written only
+        # under _initialization_lock; see the re-entrancy guard in initialize.
+        self._initializing_thread_id: Optional[int] = None
 
         if event_dispatcher is None:
             self._event_dispatcher = EventDispatcher()
@@ -2689,6 +2702,20 @@ class NodesManager:
         with self._lock:
             return self._epoch
 
+    @contextmanager
+    def _initializing_on_this_thread(self):
+        """
+        Mark the calling thread as the one currently running ``initialize``.
+
+        Must be entered while holding ``_initialization_lock`` - that is what
+        makes the calling thread the only writer of ``_initializing_thread_id``.
+        """
+        self._initializing_thread_id = threading.get_ident()
+        try:
+            yield
+        finally:
+            self._initializing_thread_id = None
+
     def initialize(
         self,
         additional_startup_nodes_info: Optional[List[Tuple[str, int]]] = None,
@@ -2717,6 +2744,28 @@ class NodesManager:
             Name of the node that just failed and should be tried only after
             other startup and additional startup nodes during this refresh.
         """
+        if self._initializing_thread_id == threading.get_ident():
+            # Re-entrant call on the thread that is already refreshing the
+            # topology: a push notification (SMIGRATED) arrived on the CLUSTER
+            # SLOTS response below and was handled inline on this thread. The
+            # outer call is mid-refresh and will publish its own result, so
+            # running a nested refresh here would reset() and swap the caches
+            # underneath it, only for the outer call to overwrite them again
+            # with its older snapshot. Skip instead; the outer refresh reads the
+            # authoritative slot map anyway, and anything it still misses is
+            # recovered through MOVED redirection.
+            #
+            # Reading the attribute without the lock is safe: while this thread
+            # holds _initialization_lock it is the only writer, so a match can
+            # only ever mean "this thread set it". A stale ident belonging to
+            # another thread simply fails the comparison and falls through to
+            # the normal blocking acquire below.
+            if is_debug_log_enabled():
+                logger.debug(
+                    "Topology refresh: skipping re-entrant initialize on thread "
+                    f"{threading.get_ident()}"
+                )
+            return
         self.reset()
         tmp_nodes_cache = {}
         tmp_slots = {}
@@ -2729,7 +2778,7 @@ class NodesManager:
         if additional_startup_nodes_info is None:
             additional_startup_nodes_info = []
 
-        with self._initialization_lock:
+        with self._initialization_lock, self._initializing_on_this_thread():
             with self._lock:
                 if epoch != self._epoch:
                     # another thread has already re-initialized the nodes; don't
