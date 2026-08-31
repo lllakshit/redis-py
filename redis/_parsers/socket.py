@@ -134,7 +134,14 @@ class SocketBuffer:
                 # rather than replacing it - the next read raises ConnectionError.
                 pass
             if custom_timeout:
-                sock.settimeout(self.socket_timeout)
+                try:
+                    sock.settimeout(self.socket_timeout)
+                except OSError:
+                    # Same window as the seek above: the close that dropped the
+                    # buffer closed the socket too, so there is nothing left to
+                    # restore the timeout on. Staying quiet keeps the outcome the
+                    # body reported instead of replacing it with EBADF.
+                    pass
 
     def can_read(self, timeout: float = 0) -> bool:
         return bool(self.unread_bytes()) or self._read_from_socket(

@@ -3874,6 +3874,11 @@ class TestClusterNodeConnectionHandling:
             def should_reconnect(self) -> bool:
                 return True
 
+            def extract_connection_details(self) -> str:
+                # release() renders the connection into its debug log before
+                # scheduling the disconnect, so the double must expose this.
+                return "fake connection details"
+
             async def disconnect(self) -> None:
                 raise RuntimeError("simulated disconnect failure")
 

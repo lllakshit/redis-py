@@ -6,6 +6,7 @@ import threading
 import time
 import weakref
 from collections import defaultdict
+from contextlib import contextmanager
 from unittest import mock
 from unittest.mock import patch
 
@@ -3981,6 +3982,10 @@ class TestClusterPubSubSlotMigration:
         p = PubSub(mock.MagicMock(), encoder=Encoder("utf-8", "strict", False))
         p.shard_channels = {channel: handler}
         p.subscribed_event.set()
+        # A subscribed per-node pubsub is connected; the poll path skips one
+        # whose connection is gone. Only the wire read is stubbed, so this is
+        # just the non-None marker that state needs.
+        p.connection = mock.MagicMock()
         p.parse_response = mock.MagicMock(return_value=raw_response)
         return p
 
@@ -4135,6 +4140,56 @@ class TestClusterPubSubSlotMigration:
         assert reconciler_done.wait(timeout=5.0)
         node_ps.ssubscribe.assert_called_once_with(b"bar")
 
+    def test_poll_rechecks_the_subscription_under_the_io_lock(self):
+        """
+        The prelude's subscription check is deliberately outside the I/O lock,
+        so the GC can close this pubsub while the reader waits for that lock -
+        every teardown site does its reset() holding it. That leaves
+        parse_response with a None connection and a RuntimeError no poll site
+        catches, so the check has to be repeated once the lock is held.
+        """
+        pubsub = self._make_cluster_pubsub()
+        node_ps = self._make_real_node_pubsub(None)
+        node_ps.parse_response = mock.MagicMock(
+            side_effect=AssertionError("read a pubsub the GC had already closed")
+        )
+        real_poll_io_lock = pubsub._poll_io_lock
+
+        @contextmanager
+        def _closing_lock(target, timeout):
+            with real_poll_io_lock(target, timeout):
+                # What a teardown site does while holding this very lock.
+                target.shard_channels.clear()
+                target.subscribed_event.clear()
+                target.connection = None
+                yield
+
+        with mock.patch.object(pubsub, "_poll_io_lock", _closing_lock):
+            assert pubsub._poll_node_pubsub(node_ps, 0.01) is None
+
+    def test_reset_holds_the_node_io_lock(self):
+        """
+        The other per-node teardown sites take the I/O lock; reset() must too,
+        so it does not tear the socket down beneath a bounded poll parked in
+        parse_response. Mirrors async ClusterPubSub.aclose.
+        """
+        pubsub = self._make_cluster_pubsub()
+        node = self._make_node("127.0.0.1:7000")
+        node_ps = self._make_real_node_pubsub(None)
+        io_lock = ClusterPubSub._pubsub_io_lock(node_ps)
+        pubsub.node_pubsub_mapping[node.name] = node_ps
+
+        observed = []
+        # reset() swallows exceptions from a per-node reset, so the observed
+        # list - not an assert inside the stub - is what makes this fail.
+        node_ps.reset = lambda: observed.append(_rlock_held_by_another_thread(io_lock))
+
+        pubsub.reset()
+
+        assert observed == [True]
+        assert not _rlock_held_by_another_thread(io_lock)
+        assert pubsub.node_pubsub_mapping == {}
+
 
 def _rlock_held_by_another_thread(lock):
     """Whether ``lock`` is currently held, probed from a foreign thread.
@@ -4174,6 +4229,9 @@ class _StatefulNodePubSub:
         self.subscribed_event = threading.Event()
         if self.shard_channels:
             self.subscribed_event.set()
+        # Connected, like any per-node pubsub the reader can poll: the poll
+        # path skips one whose connection a teardown has already dropped.
+        self.connection = mock.MagicMock()
         self.sunsubscribe_error = None
         self.get_message_error = None
         self.reset_calls = 0

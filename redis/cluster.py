@@ -3469,6 +3469,14 @@ class ClusterPubSub(PubSub):
                 # so no messages are available
                 return None
         with self._poll_io_lock(pubsub, timeout):
+            # Re-check now that no writer can be mid-flight: the prelude above
+            # can pass and the GC then close this pubsub while holding this very
+            # lock, which would leave parse_response with the None connection it
+            # raises RuntimeError on. Only the connection is re-checked, not
+            # ``subscribed``: a pubsub whose last channel was detached locally
+            # may still have an in-flight SUNSUBSCRIBE confirmation to read.
+            if pubsub.connection is None:
+                return None
             response = pubsub.parse_response(block=(timeout is None), timeout=timeout)
             # get_message's truthiness test, not "is None": a health check
             # reply filtered out by parse_response, or an empty bulk, is "no
@@ -3986,9 +3994,18 @@ class ClusterPubSub(PubSub):
             # Errors are swallowed because reset() is also a fallback path
             # from __del__; we cannot let one buggy per-node pubsub mask the
             # rest of the teardown.
+            # The per-node I/O lock keeps the socket from being torn down
+            # beneath a concurrent bounded poll parked in parse_response. It is
+            # an RLock, so re-entry from this thread is fine; contention is with
+            # another thread's bounded poll and is bounded by that poll's
+            # timeout (an unbounded poll holds nullcontext() - see
+            # _poll_io_lock). reset() is also the __del__ fallback path, where
+            # the try below does not cover a blocking acquire - that boundedness
+            # is what makes taking the lock here safe.
             for pubsub in self.node_pubsub_mapping.values():
                 try:
-                    pubsub.reset()
+                    with self._pubsub_io_lock(pubsub):
+                        pubsub.reset()
                 except Exception:
                     pass
             # Drop the now-dead per-node pubsubs from the mapping so the

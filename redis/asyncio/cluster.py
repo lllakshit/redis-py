@@ -1762,6 +1762,16 @@ class ClusterNode:
         The connection will auto-reconnect on next use.
         """
         if connection.should_reconnect():
+            # Render the connection before disconnecting: extract_connection_details()
+            # reads the local port and the in-flight read deadline off the transport, so
+            # after disconnect() it can only report "not connected". This line is what
+            # records the maintenance state and relaxed timeout at the moment they are
+            # discarded, so a maintenance-driven recycle is attributable in the logs.
+            if logger.isEnabledFor(logging.DEBUG):
+                logger.debug(
+                    "Disconnecting acquired connection marked for reconnect: "
+                    f"{connection}, {connection.extract_connection_details()}"
+                )
             await connection.disconnect()
 
     def release(self, connection: Connection) -> None:
@@ -1773,6 +1783,14 @@ class ClusterNode:
         """
         if connection.should_reconnect():
             if connection.is_connected:
+                # Logged here rather than in _disconnect_and_release: that runs as a
+                # task after the fact, by which point extract_connection_details()
+                # may already have lost the transport it reads from.
+                if logger.isEnabledFor(logging.DEBUG):
+                    logger.debug(
+                        "Disconnecting released connection marked for reconnect: "
+                        f"{connection}, {connection.extract_connection_details()}"
+                    )
                 task = asyncio.create_task(self._disconnect_and_release(connection))
                 self._background_tasks.add(task)
                 task.add_done_callback(self._background_tasks.discard)
@@ -4105,13 +4123,23 @@ class ClusterPubSub(PubSub):
         ``PubSub`` itself has, and closing it would mean duplicating
         ``handle_message``'s dispatch here.
 
-        The async ``PubSub.get_message`` has no subscription-wait prelude to
-        mirror - ``subscribed`` is a plain property and there is no
-        ``subscribed_event`` - so this reads the wire directly. The sync
-        counterpart in ``redis/cluster.py`` carries that prelude, and hoists it
-        out of the lock.
+        The async ``PubSub`` has no ``subscribed_event`` for the sync
+        counterpart's subscription wait to mirror, but the connectionless state
+        that wait guards against still has to be handled: a per-node pubsub
+        enters ``node_pubsub_mapping`` before its first ``SSUBSCRIBE``
+        (``_get_node_pubsub``) and is left connectionless by ``aclose()`` (the
+        GC in ``reinitialize_shard_subscriptions``), while ``parse_response``
+        raises ``RuntimeError`` on a ``None`` connection - which neither poll
+        site catches. ``_pubsubs_generator`` yields from a snapshot of the
+        mapping, so it can hand out a pubsub the GC has just dropped. Checking
+        under the I/O lock rather than before it closes that window for every
+        bounded poll, because the GC ``aclose()``s under the same lock.
         """
         async with self._poll_io_lock(pubsub, timeout):
+            if pubsub.connection is None:
+                # Not connected yet, or closed by a concurrent teardown.
+                # Reading would raise RuntimeError; skip this node instead.
+                return None
             response = await pubsub.parse_response(
                 block=(timeout is None), timeout=timeout
             )
@@ -4618,9 +4646,14 @@ class ClusterPubSub(PubSub):
         # below, silently dropping subscription intent.
         async with self._shard_state_lock:
             self._reconcile_tasks.clear()
-            # Close all shard pubsub instances first
+            # Close all shard pubsub instances first, under the per-node I/O
+            # lock so the socket is not torn down beneath a concurrent bounded
+            # poll parked in parse_response. A bounded poll holds the lock only
+            # for its timeout, and an unbounded one holds nullcontext() (see
+            # _poll_io_lock), so teardown never waits indefinitely here.
             for pubsub in self.node_pubsub_mapping.values():
-                await pubsub.aclose()
+                async with self._pubsub_io_lock(pubsub):
+                    await pubsub.aclose()
             # Drop the now-dead per-node pubsubs from the mapping so the
             # round-robin in _pubsubs_generator / _sharded_message_generator
             # cannot yield them between teardown and re-subscription.
@@ -4678,11 +4711,22 @@ class ClusterPubSub(PubSub):
         command = args[0].upper() if args else ""
         if command in ("SSUBSCRIBE", "SUNSUBSCRIBE", "SPUBLISH"):
             if len(args) > 1:
+                # ssubscribe / sunsubscribe own both the per-node I/O lock and
+                # the shard_channels / _shard_channel_to_node bookkeeping, so
+                # delegate to them instead of dispatching raw. A raw dispatch
+                # writes the socket unguarded against a concurrent poll and
+                # records nothing, leaving the channel invisible to the reader
+                # loop and to on_connect's replay.
+                if command == "SSUBSCRIBE":
+                    return await self.ssubscribe(*args[1:])
+                if command == "SUNSUBSCRIBE":
+                    return await self.sunsubscribe(*args[1:])
                 channel = args[1]
                 node = self.cluster.get_node_from_key(channel)
                 if node:
                     pubsub = self._get_node_pubsub(node)
-                    return await pubsub.execute_command(*args, **kwargs)
+                    async with self._pubsub_io_lock(pubsub):
+                        return await pubsub.execute_command(*args, **kwargs)
 
         # For other commands, use the set node or lazily discover one
         if self.connection is None:

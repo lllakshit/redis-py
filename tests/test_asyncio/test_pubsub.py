@@ -3226,6 +3226,10 @@ class TestClusterPubSubSlotMigration:
         """
         p = PubSub(MagicMock(), encoder=Encoder("utf-8", "strict", False))
         p.shard_channels = {channel: handler}
+        # A subscribed per-node pubsub is connected; the poll path skips one
+        # whose connection is gone. Only the wire read is stubbed, so this is
+        # just the non-None marker that state needs.
+        p.connection = MagicMock()
         p.parse_response = AsyncMock(return_value=raw_response)
         return p
 
@@ -3341,6 +3345,154 @@ class TestClusterPubSubSlotMigration:
         assert node_ps.shard_channels == {}
         assert not node_ps.subscribed
 
+    def _make_gone_node_pubsub(self):
+        """A per-node ``PubSub`` in the state the reconciliation GC leaves.
+
+        ``parse_response`` stays real - it is what raises ``RuntimeError`` on a
+        ``None`` connection, so stubbing it would make the regression
+        untestable.
+        """
+        p = PubSub(MagicMock(), encoder=Encoder("utf-8", "strict", False))
+        p.shard_channels = {b"foo": None}
+        return p
+
+    async def test_poll_skips_a_pubsub_the_gc_closed_mid_pass(self):
+        """
+        _pubsubs_generator yields from a snapshot of node_pubsub_mapping, so a
+        per-node pubsub the reconciliation GC aclose()d and popped can still
+        reach _poll_node_pubsub. PubSub.parse_response raises RuntimeError on a
+        None connection, and _sharded_message_generator catches only
+        Moved/Connection/Timeout/OSError - so the whole pass aborted, taking
+        the healthy siblings' messages with it.
+        """
+        pubsub = self._make_cluster_pubsub()
+        closed_ps = self._make_gone_node_pubsub()
+        await closed_ps.aclose()
+        live_ps = self._make_real_node_pubsub([b"smessage", b"foo", b"hi"])
+        pubsub.node_pubsub_mapping = {
+            "127.0.0.1:7000": closed_ps,
+            "127.0.0.1:7001": live_ps,
+        }
+        pubsub._pubsubs_generator = ClusterPubSub._pubsubs_generator(pubsub)
+
+        message = await pubsub.get_sharded_message(timeout=0.01)
+
+        assert closed_ps.connection is None
+        assert message is not None
+        assert message["channel"] == b"foo"
+
+    @pytest.mark.parametrize("via_target_node", [True, False])
+    async def test_poll_skips_a_never_subscribed_pubsub(self, via_target_node):
+        """
+        _get_node_pubsub registers a per-node pubsub before its caller's first
+        ssubscribe, and awaiting the I/O lock in between lets the reader task
+        in - so a poll can land on a pubsub whose connection is still None.
+        """
+        pubsub = self._make_cluster_pubsub()
+        node = self._make_node("127.0.0.1:7000")
+        node_ps = PubSub(MagicMock(), encoder=Encoder("utf-8", "strict", False))
+        pubsub.node_pubsub_mapping[node.name] = node_ps
+        pubsub._pubsubs_generator = ClusterPubSub._pubsubs_generator(pubsub)
+
+        if via_target_node:
+            message = await pubsub.get_sharded_message(timeout=0.01, target_node=node)
+        else:
+            message = await pubsub.get_sharded_message(timeout=0.01)
+
+        assert message is None
+
+    # --- shard commands routed through execute_command --------------------
+
+    @pytest.mark.parametrize(
+        "command,override",
+        [("SSUBSCRIBE", "ssubscribe"), ("SUNSUBSCRIBE", "sunsubscribe")],
+    )
+    async def test_execute_command_delegates_shard_subscriptions(
+        self, command, override
+    ):
+        """
+        execute_command's shard branch used to dispatch SSUBSCRIBE /
+        SUNSUBSCRIBE straight at the per-node pubsub, which both wrote the
+        socket without the per-node I/O lock and recorded nothing - so the
+        channel stayed invisible to the reader loop and to on_connect's replay.
+        It must go through the overrides, which own the lock and the
+        bookkeeping.
+        """
+        pubsub = self._make_cluster_pubsub()
+        node = self._make_node("127.0.0.1:7000")
+        node_ps = self._make_node_pubsub()
+        pubsub.node_pubsub_mapping[node.name] = node_ps
+        pubsub.cluster.get_node_from_key.return_value = node
+        delegate = AsyncMock()
+        setattr(pubsub, override, delegate)
+
+        await pubsub.execute_command(command, b"foo")
+
+        delegate.assert_awaited_once_with(b"foo")
+        node_ps.execute_command.assert_not_called()
+
+    async def test_execute_command_ssubscribe_records_the_channel(self):
+        """
+        End-to-end counterpart to the delegation test: the bookkeeping the raw
+        dispatch skipped actually lands.
+        """
+        pubsub = self._make_cluster_pubsub()
+        node = self._make_node("127.0.0.1:7000")
+        node_ps = self._make_node_pubsub()
+        pubsub.node_pubsub_mapping[node.name] = node_ps
+        pubsub.cluster.get_node_from_key.return_value = node
+
+        await pubsub.execute_command("SSUBSCRIBE", b"foo")
+
+        node_ps.ssubscribe.assert_awaited_once_with(b"foo")
+        assert pubsub._shard_channel_to_node[b"foo"] == node.name
+
+    async def test_execute_command_spublish_holds_the_node_io_lock(self):
+        """
+        SPUBLISH stays a raw send - there is no override to delegate to - so
+        the branch itself has to take the per-node I/O lock, or the send can
+        reconnect the socket under a concurrent bounded poll.
+        """
+        pubsub = self._make_cluster_pubsub()
+        node = self._make_node("127.0.0.1:7000")
+        node_ps = self._make_real_node_pubsub(None)
+        io_lock = ClusterPubSub._pubsub_io_lock(node_ps)
+        pubsub.node_pubsub_mapping[node.name] = node_ps
+        pubsub.cluster.get_node_from_key.return_value = node
+
+        observed = []
+        node_ps.execute_command = AsyncMock(
+            side_effect=lambda *a, **kw: observed.append(io_lock.locked())
+        )
+
+        await pubsub.execute_command("SPUBLISH", b"foo", b"hi")
+
+        assert observed == [True]
+        assert not io_lock.locked()
+
+    async def test_aclose_holds_the_node_io_lock(self):
+        """
+        The other four per-node aclose() sites take the I/O lock; teardown must
+        too, so it does not disconnect the socket beneath a bounded poll parked
+        in parse_response.
+        """
+        pubsub = self._make_cluster_pubsub()
+        node = self._make_node("127.0.0.1:7000")
+        node_ps = self._make_real_node_pubsub(None)
+        io_lock = ClusterPubSub._pubsub_io_lock(node_ps)
+        pubsub.node_pubsub_mapping[node.name] = node_ps
+
+        observed = []
+        node_ps.aclose = AsyncMock(
+            side_effect=lambda: observed.append(io_lock.locked())
+        )
+
+        await pubsub.aclose()
+
+        assert observed == [True]
+        assert not io_lock.locked()
+        assert pubsub.node_pubsub_mapping == {}
+
 
 class _StatefulNodePubSub:
     """Per-node ``PubSub`` stand-in with real subscription state.
@@ -3359,6 +3511,9 @@ class _StatefulNodePubSub:
         self.subscribed_event = asyncio.Event()
         if self.shard_channels:
             self.subscribed_event.set()
+        # Connected, like any per-node pubsub the reader can poll: the poll
+        # path skips one whose connection a teardown has already dropped.
+        self.connection = MagicMock()
         self.sunsubscribe_error = None
         self.get_message_error = None
         self.aclose_calls = 0
