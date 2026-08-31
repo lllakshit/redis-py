@@ -3071,6 +3071,58 @@ class TestClusterPubSubSlotMigration:
         assert await pubsub._sharded_message_generator(timeout=0.01) == (None, None)
         assert bad.get_message.await_count == 2
 
+    async def test_sharded_message_generator_blocks_when_all_nodes_cool_off(self):
+        """
+        A pass in which every node is skipped for cool-off performs no wire
+        read, so returning straight away ignores the timeout the caller asked
+        to block for - and a reader loop on ``get_sharded_message`` polls right
+        back, spinning until the cool-off expires instead of blocking.
+        """
+        pubsub = self._make_cluster_pubsub()
+        bad = self._make_node_pubsub({b"foo": None})
+        bad.get_message.side_effect = ConnectionError("node is gone")
+        pubsub.node_pubsub_mapping = {"127.0.0.1:7000": bad}
+        self._prime_generator(pubsub)
+        pubsub._poll_cool_off[bad] = time.monotonic() + 30
+
+        start = time.monotonic()
+        assert await pubsub._sharded_message_generator(timeout=0.05) == (None, None)
+        elapsed = time.monotonic() - start
+
+        assert bad.get_message.await_count == 0
+        assert elapsed >= 0.05
+
+    async def test_sharded_message_generator_cool_off_wait_ends_with_the_window(self):
+        """The wait is bounded by the cool-off, not by a long caller timeout."""
+        pubsub = self._make_cluster_pubsub()
+        bad = self._make_node_pubsub({b"foo": None})
+        bad.get_message.side_effect = ConnectionError("node is gone")
+        pubsub.node_pubsub_mapping = {"127.0.0.1:7000": bad}
+        self._prime_generator(pubsub)
+        pubsub._poll_cool_off[bad] = time.monotonic() + 0.05
+
+        start = time.monotonic()
+        assert await pubsub._sharded_message_generator(timeout=30) == (None, None)
+        elapsed = time.monotonic() - start
+
+        assert 0.05 <= elapsed < 5
+
+    async def test_sharded_message_generator_cool_off_does_not_block_zero_timeout(
+        self,
+    ):
+        """A non-blocking poll must stay non-blocking while nodes cool off."""
+        pubsub = self._make_cluster_pubsub()
+        bad = self._make_node_pubsub({b"foo": None})
+        bad.get_message.side_effect = ConnectionError("node is gone")
+        pubsub.node_pubsub_mapping = {"127.0.0.1:7000": bad}
+        self._prime_generator(pubsub)
+        pubsub._poll_cool_off[bad] = time.monotonic() + 30
+
+        start = time.monotonic()
+        assert await pubsub._sharded_message_generator(timeout=0.0) == (None, None)
+
+        assert time.monotonic() - start < 1
+
     async def test_sharded_message_generator_clears_cool_off_on_success(self):
         """A pubsub that polls cleanly must not stay in cool-off."""
         pubsub = self._make_cluster_pubsub()

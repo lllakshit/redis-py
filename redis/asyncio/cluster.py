@@ -4002,18 +4002,21 @@ class ClusterPubSub(PubSub):
         first_error: Optional[BaseException] = None
         polled = 0
         failed = 0
+        next_ready: Optional[float] = None
         for _ in range(len(self.node_pubsub_mapping)):
             pubsub = next(self._pubsubs_generator)
             if pubsub is None:
                 # node_pubsub_mapping was emptied between the len() above and
                 # here; nothing left to poll in this pass.
                 break
-            if self._poll_cool_off and time.monotonic() < self._poll_cool_off.get(
-                pubsub, 0.0
-            ):
-                # In cool-off after a failed poll: skip it so the reader spends
-                # this pass on the nodes that can still deliver.
-                continue
+            if self._poll_cool_off:
+                deadline = self._poll_cool_off.get(pubsub, 0.0)
+                if time.monotonic() < deadline:
+                    # In cool-off after a failed poll: skip it so the reader
+                    # spends this pass on the nodes that can still deliver.
+                    if next_ready is None or deadline < next_ready:
+                        next_ready = deadline
+                    continue
             polled += 1
             try:
                 message = await self._poll_node_pubsub(pubsub, timeout)
@@ -4080,7 +4083,29 @@ class ClusterPubSub(PubSub):
                 return pubsub, message
         if first_error is not None and failed == polled:
             raise first_error
+        if polled == 0 and next_ready is not None:
+            await self._wait_out_cool_off(next_ready, timeout)
         return None, None
+
+    @staticmethod
+    async def _wait_out_cool_off(next_ready: float, timeout: Optional[float]) -> None:
+        """Wait out a pass in which every node was skipped for cool-off.
+
+        Such a pass does no wire read at all, so returning straight away
+        ignores the timeout the caller asked to block for - and a reader loop
+        on ``get_sharded_message`` polls back immediately, spinning until the
+        cool-off expires instead of blocking. Sleep instead: until the
+        earliest cool-off is over, never longer than the caller's timeout, and
+        not at all for a non-blocking poll.
+        """
+        if timeout is not None and timeout <= 0:
+            return
+        delay = next_ready - time.monotonic()
+        if delay <= 0:
+            return
+        if timeout is not None:
+            delay = min(delay, timeout)
+        await asyncio.sleep(delay)
 
     def _poll_io_lock(self, pubsub: PubSub, timeout: Optional[float]):
         """Guard a per-node poll against concurrent writers on the same socket.
